@@ -48,3 +48,6 @@ python scripts/batch_analysis.py --events artifacts/generated_events.jsonl --met
 - All timestamps are ISO 8601 with `Z` suffix.
 - Late events are deliberately generated and are older than the 30-second watermark tolerance but still within the required 35-90 second range for validation.
 - The Flink job computes user tumbling-window features, content sliding-window features, and category affinity features enriched from content metadata.
+
+
+The link to video Demo `https://youtu.be/SkN4xrUpHTs` .
