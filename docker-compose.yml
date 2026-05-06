@@ -1,0 +1,175 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: "2181"
+      ZOOKEEPER_TICK_TIME: "2000"
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'nc -z 127.0.0.1 2181'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: "1"
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+    ports:
+      - "19092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'kafka-topics --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 40s
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      set -e
+      echo "Creating Kafka topics..."
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ${USER_EVENTS_TOPIC:-user-events} --partitions 3 --replication-factor 1
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ${CONTENT_METADATA_TOPIC:-content-metadata} --partitions 1 --replication-factor 1 --config cleanup.policy=compact
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ${FEATURE_STORE_TOPIC:-feature-store} --partitions 1 --replication-factor 1 --config cleanup.policy=compact
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ${PIPELINE_METRICS_TOPIC:-pipeline-metrics} --partitions 1 --replication-factor 1
+
+      kafka-topics --bootstrap-server kafka:9092 --list
+
+      echo "Kafka topics created successfully!"
+
+  producer:
+    build:
+      context: ./producer
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      USER_EVENTS_TOPIC: ${USER_EVENTS_TOPIC:-user-events}
+      CONTENT_METADATA_TOPIC: ${CONTENT_METADATA_TOPIC:-content-metadata}
+      FEATURE_STORE_TOPIC: ${FEATURE_STORE_TOPIC:-feature-store}
+      PIPELINE_METRICS_TOPIC: ${PIPELINE_METRICS_TOPIC:-pipeline-metrics}
+      PRODUCER_HTTP_PORT: ${PRODUCER_HTTP_PORT:-8000}
+      PRODUCER_SPEEDUP_FACTOR: ${PRODUCER_SPEEDUP_FACTOR:-60}
+      PRODUCER_EVENT_INTERVAL_SECONDS: ${PRODUCER_EVENT_INTERVAL_SECONDS:-0.2}
+      PRODUCER_LATE_EVENT_RATE: ${PRODUCER_LATE_EVENT_RATE:-0.05}
+      PRODUCER_SIMULATION_SEED: ${PRODUCER_SIMULATION_SEED:-42}
+      PRODUCER_LATE_EVENT_MIN_SECONDS: ${PRODUCER_LATE_EVENT_MIN_SECONDS:-35}
+      PRODUCER_LATE_EVENT_MAX_SECONDS: ${PRODUCER_LATE_EVENT_MAX_SECONDS:-90}
+      PRODUCER_DATA_DIR: ${PRODUCER_DATA_DIR:-/data}
+    volumes:
+      - ./artifacts:/data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  flink-jobmanager:
+    build:
+      context: ./flink-jobmanager
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      producer:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      USER_EVENTS_TOPIC: ${USER_EVENTS_TOPIC:-user-events}
+      CONTENT_METADATA_TOPIC: ${CONTENT_METADATA_TOPIC:-content-metadata}
+      FEATURE_STORE_TOPIC: ${FEATURE_STORE_TOPIC:-feature-store}
+      PIPELINE_METRICS_TOPIC: ${PIPELINE_METRICS_TOPIC:-pipeline-metrics}
+      PIPELINE_HTTP_PORT: ${PIPELINE_HTTP_PORT:-8090}
+      PIPELINE_PARALLELISM: ${PIPELINE_PARALLELISM:-1}
+      PIPELINE_KAFKA_STARTUP_MAX_ATTEMPTS: ${PIPELINE_KAFKA_STARTUP_MAX_ATTEMPTS:-30}
+      PIPELINE_KAFKA_STARTUP_RETRY_SECONDS: ${PIPELINE_KAFKA_STARTUP_RETRY_SECONDS:-2}
+      PIPELINE_USER_WINDOW_MINUTES: ${PIPELINE_USER_WINDOW_MINUTES:-5}
+      PIPELINE_CONTENT_WINDOW_MINUTES: ${PIPELINE_CONTENT_WINDOW_MINUTES:-5}
+      PIPELINE_CONTENT_SLIDE_MINUTES: ${PIPELINE_CONTENT_SLIDE_MINUTES:-1}
+      PIPELINE_CATEGORY_WINDOW_MINUTES: ${PIPELINE_CATEGORY_WINDOW_MINUTES:-5}
+      PRODUCER_DATA_DIR: ${PRODUCER_DATA_DIR:-/data}
+    volumes:
+      - ./artifacts:/data
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'curl -fsS http://127.0.0.1:8090/health | grep -q \"\\\"ready\\\":true\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 40s
+
+  flink-taskmanager:
+    build:
+      context: ./taskmanager
+    restart: unless-stopped
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    environment:
+      TASKMANAGER_PORT: ${TASKMANAGER_PORT:-8082}
+    ports:
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/health', timeout=2).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  dashboard:
+    build:
+      context: ./dashboard
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      producer:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      FEATURE_STORE_TOPIC: ${FEATURE_STORE_TOPIC:-feature-store}
+      PIPELINE_METRICS_TOPIC: ${PIPELINE_METRICS_TOPIC:-pipeline-metrics}
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-8501}
+      DASHBOARD_HTTP_HOST: ${DASHBOARD_HTTP_HOST:-0.0.0.0}
+    ports:
+      - "8501:8501"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/health', timeout=2).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
